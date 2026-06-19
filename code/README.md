@@ -45,11 +45,15 @@ export GEMINI_API_KEY="replace-with-your-key"
 python3 code/main_gemini.py --output output.csv
 
 # Optional
-GEMINI_MODEL=gemini-2.5-flash python3 code/main_gemini.py --limit 3
+python3 code/main_gemini.py --list-models
+GEMINI_MODEL=auto python3 code/main_gemini.py --limit 3
 python3 code/main_gemini.py --model gemini-2.5-flash --strategy holistic
 ```
 
-`GOOGLE_API_KEY` is also accepted. Do not commit `.env` or API keys.
+`GOOGLE_API_KEY` is also accepted. The default model is `auto`, which lists
+the models available to your key and picks a Flash model that supports
+`generateContent`. If a forced model returns 404, run `--list-models` and pass
+one of the returned `models/...` names. Do not commit `.env` or API keys.
 
 ## Strategies
 

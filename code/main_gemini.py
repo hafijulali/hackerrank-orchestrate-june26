@@ -12,6 +12,7 @@ import mimetypes
 import os
 import sys
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,12 @@ from agent import data, pipeline, schema
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROMPT_VERSION = "gemini-v1"
+PREFERRED_MODELS = (
+    "models/gemini-2.5-flash",
+    "models/gemini-2.0-flash",
+    "models/gemini-1.5-flash",
+    "models/gemini-1.5-flash-latest",
+)
 
 
 class GeminiClient:
@@ -92,14 +99,15 @@ class GeminiClient:
         return parts
 
     def _post(self, payload):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        model_path = _model_path(self.model)
+        key = urllib.parse.quote(self.api_key, safe="")
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={key}"
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": self.api_key,
             },
             method="POST",
         )
@@ -115,6 +123,58 @@ class GeminiClient:
         usage = response.get("usageMetadata") or {}
         total_tokens = int(usage.get("totalTokenCount") or 0)
         return response, total_tokens, None
+
+
+def _model_path(model):
+    model = (model or "").strip()
+    if not model:
+        raise SystemExit("Gemini model cannot be empty.")
+    return model if model.startswith("models/") else f"models/{model}"
+
+
+def _list_models(api_key, timeout):
+    models = _fetch_models(api_key, timeout)
+    for model in models:
+        print(f"{model['name']}\t{','.join(model['methods'])}")
+
+
+def _fetch_models(api_key, timeout):
+    key = urllib.parse.quote(api_key, safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+    req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[-500:]
+        raise SystemExit(f"Could not list Gemini models: http_{exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not list Gemini models: {exc}") from exc
+
+    out = []
+    for model in payload.get("models", []):
+        methods = model.get("supportedGenerationMethods", [])
+        if "generateContent" in methods:
+            out.append({"name": model.get("name", ""), "methods": methods})
+    return out
+
+
+def _resolve_model(model, api_key, timeout):
+    model = (model or "").strip()
+    if model and model != "auto":
+        return model
+
+    available = {m["name"] for m in _fetch_models(api_key, timeout)}
+    for preferred in PREFERRED_MODELS:
+        if preferred in available:
+            return preferred
+
+    flash = sorted(name for name in available if "flash" in name)
+    if flash:
+        return flash[-1]
+    if available:
+        return sorted(available)[-1]
+    raise SystemExit("No Gemini models supporting generateContent are available to this API key.")
 
 
 def _gemini_schema(value):
@@ -196,9 +256,17 @@ def main(argv=None):
     parser.add_argument("--strategy", choices=list(pipeline.STRATEGIES), default="holistic")
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--model", default=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+    parser.add_argument("--model", default=os.getenv("GEMINI_MODEL", "auto"))
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--list-models", action="store_true",
+                        help="List Gemini models available to the configured API key and exit.")
     args = parser.parse_args(argv)
+
+    api_key = _api_key()
+    if args.list_models:
+        _list_models(api_key, args.timeout)
+        return
+    args.model = _resolve_model(args.model, api_key, args.timeout)
 
     claims = data.load_claims(args.input)
     if args.limit > 0:
@@ -207,7 +275,7 @@ def main(argv=None):
     requirements = data.load_evidence_requirements(
         os.path.join(REPO_ROOT, "dataset", "evidence_requirements.csv"))
 
-    client = GeminiClient(REPO_ROOT, api_key=_api_key(), model=args.model, timeout=args.timeout)
+    client = GeminiClient(REPO_ROOT, api_key=api_key, model=args.model, timeout=args.timeout)
     rows = [None] * len(claims)
     totals = {"tokens": 0, "calls": 0, "failed": 0}
     start = time.time()
@@ -227,6 +295,8 @@ def main(argv=None):
             totals["calls"] += 0 if meta["cached"] else 1
             if meta["error"]:
                 totals["failed"] += 1
+                print(f"[error] user={row['user_id']} gemini_model={args.model} "
+                      f"error={meta['error']}", file=sys.stderr)
             done += 1
             print(f"[{done}/{len(claims)}] user={row['user_id']} "
                   f"status={row['claim_status']} tokens+={meta['tokens']}", file=sys.stderr)
